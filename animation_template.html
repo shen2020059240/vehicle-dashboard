@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>多车轨迹动画 - 可点击缩放信息框（含聚合显示）</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+    <style>
+        body { margin:0; padding:0; font-family: Arial, sans-serif; }
+        #map { position: absolute; top:0; bottom:0; width:100%; }
+
+        .controls {
+            position: absolute; bottom: 20px; left: 20px; z-index: 1000;
+            background: white; padding: 15px; border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3); min-width: 320px;
+        }
+
+        .info-panel {
+            position: absolute; background: rgba(255,255,255,0.97); padding: 10px 14px;
+            border-radius: 8px; font-size: 13px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            border-left: 5px solid; pointer-events: auto; cursor: pointer;
+            white-space: nowrap; z-index: 1000; transition: all 0.25s ease;
+            user-select: none;
+        }
+        .info-panel:hover {
+            transform: scale(1.03); box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+        }
+
+        .info-panel.following {
+            border-left-width: 7px;
+            border-left-color: #e11d48 !important;
+            background: #fff0f0 !important;
+            box-shadow: 0 6px 20px rgba(225, 29, 72, 0.45) !important;
+            transform: scale(1.06);
+        }
+        .info-panel.following strong {
+            color: #e11d48;
+            font-size: 14.5px;
+        }
+
+        .info-panel .close-btn {
+            position: absolute; top: 4px; right: 6px; font-size: 16px; line-height: 1;
+            color: #999; cursor: pointer;
+        }
+        .pulse { animation: pulse 1.2s ease-out; }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 14px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        .vehicle-selector { position: absolute; top: 20px; right: 20px; z-index: 1001; }
+        .selector-btn {
+            background: white; border: none; padding: 10px 16px; border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2); cursor: pointer; font-size: 14px; font-weight: bold;
+        }
+        .dropdown-panel {
+            position: absolute; top: 48px; right: 0; background: white; border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3); padding: 15px; width: 340px; max-height: 500px;
+            overflow-y: auto; display: none; z-index: 1002; border: 1px solid #ddd;
+        }
+        .checkbox-group label { display: block; margin: 8px 0; font-size: 13.5px; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="controls">
+    <button id="playBtn">▶ 播放</button>
+    <button id="pauseBtn">⏸ 暂停</button>
+    <button id="resetBtn">↺ 重置</button><br><br>
+    <label>同步方式: </label>
+    <select id="syncModeSelect" style="width:120px;">
+        <option value="distance">里程模式</option>
+        <option value="time" {USE_TIME_MODE}>时间模式</option>
+    </select><br><br>
+    <label>跟随车辆: </label>
+    <select id="followSelect" style="width:180px;">
+        {FOLLOW_OPTIONS}
+    </select><br><br>
+    <span id="progressLabel">全局进度: </span><input type="range" id="progressSlider" min="0" max="100" value="0" style="width:280px;">
+    <span id="progressPercent">0%</span><br><br>
+    <span id="timeLabel" style="font-size:12px; color:#555;">当前时间: --</span><br><br>
+    <label>播放速度: </label>
+    <input type="range" id="speedSlider" min="0.5" max="10" step="0.5" value="3.0" style="width:150px;">
+    <span id="speedValue">3.0</span> x
+</div>
+
+<div class="vehicle-selector">
+    <button id="vehicleSelectorBtn" class="selector-btn">🚗 选择车辆 ▼</button>
+    <div id="dropdownPanel" class="dropdown-panel">
+        <h4>显示车辆</h4>
+        <div id="vehicleCheckboxes" class="checkbox-group"></div>
+        <div class="btn-group" style="margin-top:12px;">
+            <button id="selectAllBtn">全选</button>
+            <button id="deselectAllBtn">全不选</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const vehicles = {VEHICLES_JSON};
+    const useTimeModeInitially = {GLOBAL_MIN_TIME} < {GLOBAL_MAX_TIME};
+    const globalMinTime = {GLOBAL_MIN_TIME};
+    const globalMaxTime = {GLOBAL_MAX_TIME};
+    const globalTimeRange = globalMaxTime - globalMinTime;
+
+    let map = L.map('map').setView([0, 0], 6);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png').addTo(map);
+
+    let polylines = [], markers = [], infoDivs = [], visible = [];
+    let clusterGroup;
+    let playing = false, animationFrame = null, globalProgress = 0, speed = 3.0;
+    let followVehicleName = "", syncMode = useTimeModeInitially ? "time" : "distance";
+    let lastInfoUpdate = 0;
+    let followPanTimeout = null;
+
+    for (let i = 0; i < vehicles.length; i++) visible.push(true);
+    let occupiedRects = [];
+
+    function getBestPosition(point, idx, width = 240, height = 96) {
+        const directions = [
+            {dx: 30, dy: -height/2}, {dx: -width-30, dy: -height/2},
+            {dx: -width/2, dy: -height-25}, {dx: -width/2, dy: 25},
+            {dx: 25, dy: -height-20}, {dx: -width-25, dy: -height-20},
+            {dx: 25, dy: 15}, {dx: -width-25, dy: 15}
+        ];
+
+        const occupied = occupiedRects.filter(r => r.idx !== idx);
+        let best = null;
+        let minOverlapArea = Infinity;
+
+        for (let dir of directions) {
+            const rect = {
+                left: point.x + dir.dx, right: point.x + dir.dx + width,
+                top: point.y + dir.dy, bottom: point.y + dir.dy + height,
+                idx: idx
+            };
+            let overlapArea = 0;
+            for (let occ of occupied) {
+                const oLeft = Math.max(rect.left, occ.left);
+                const oRight = Math.min(rect.right, occ.right);
+                const oTop = Math.max(rect.top, occ.top);
+                const oBottom = Math.min(rect.bottom, occ.bottom);
+                if (oLeft < oRight && oTop < oBottom) {
+                    overlapArea += (oRight - oLeft) * (oBottom - oTop);
+                }
+            }
+            if (overlapArea < minOverlapArea) {
+                minOverlapArea = overlapArea;
+                best = {x: point.x + dir.dx, y: point.y + dir.dy, rect};
+            }
+            if (overlapArea === 0) break;
+        }
+        return best || {x: point.x + 30, y: point.y - height/2, rect: {left:0,right:0,top:0,bottom:0,idx:idx}};
+    }
+
+    function getPositionAtTime(vehicle, targetTimeMs) {
+        const timestamps = vehicle.timestamps;
+        const coords = vehicle.coords;
+        if (!timestamps || timestamps.length < 2) {
+            return { lat: coords[0][0], lng: coords[0][1], currentDist: 0, currentTime: vehicle.times[0] || "", displayTime: vehicle.times[0] || "" };
+        }
+        if (targetTimeMs <= timestamps[0]) {
+            return { lat: coords[0][0], lng: coords[0][1], currentDist: 0, currentTime: vehicle.times[0], displayTime: vehicle.times[0] };
+        }
+        if (targetTimeMs >= timestamps[timestamps.length-1]) {
+            const last = coords.length - 1;
+            return { lat: coords[last][0], lng: coords[last][1], currentDist: vehicle.totalDistance, currentTime: vehicle.times[last], displayTime: vehicle.times[last] };
+        }
+        let idx = 0;
+        for (let i = 0; i < timestamps.length - 1; i++) {
+            if (targetTimeMs <= timestamps[i+1]) { idx = i; break; }
+        }
+        const t1 = timestamps[idx], t2 = timestamps[idx+1];
+        let ratio = (targetTimeMs - t1) / (t2 - t1);
+        ratio = Math.min(Math.max(ratio, 0), 1);
+
+        const lat = coords[idx][0] + (coords[idx+1][0] - coords[idx][0]) * ratio;
+        const lng = coords[idx][1] + (coords[idx+1][1] - coords[idx][1]) * ratio;
+
+        let cumDist = 0;
+        for (let i = 0; i < idx; i++) cumDist += vehicle.segmentDistances[i];
+        cumDist += vehicle.segmentDistances[idx] * ratio;
+
+        const interpTime = new Date(t1 + ratio * (t2 - t1));
+        const displayTime = interpTime.toLocaleString('zh-CN', {
+            year:'numeric', month:'2-digit', day:'2-digit',
+            hour:'2-digit', minute:'2-digit', second:'2-digit'
+        }).replace(/\//g, '/');
+
+        return { lat, lng, currentDist: Math.min(cumDist, vehicle.totalDistance), currentTime: vehicle.times[idx], displayTime };
+    }
+
+    function getPositionAtDistance(vehicle, progress) {
+        const targetDist = vehicle.totalDistance * progress;
+        const segDists = vehicle.segmentDistances;
+        let acc = 0;
+        for (let i = 0; i < segDists.length; i++) {
+            if (acc + segDists[i] >= targetDist || i === segDists.length - 1) {
+                let t = (targetDist - acc) / segDists[i];
+                t = Math.min(Math.max(t, 0), 1);
+                const lat = vehicle.coords[i][0] + (vehicle.coords[i+1][0] - vehicle.coords[i][0]) * t;
+                const lng = vehicle.coords[i][1] + (vehicle.coords[i+1][1] - vehicle.coords[i][1]) * t;
+                return { lat, lng, currentDist: targetDist, currentTime: vehicle.times[i] || "", displayTime: vehicle.times[i] || "" };
+            }
+            acc += segDists[i];
+        }
+        const last = vehicle.coords[vehicle.coords.length-1];
+        return { lat: last[0], lng: last[1], currentDist: vehicle.totalDistance, currentTime: vehicle.times[vehicle.times.length-1] || "", displayTime: vehicle.times[vehicle.times.length-1] || "" };
+    }
+
+    function updateAllMarkers() {
+        const now = Date.now();
+        const shouldUpdateInfo = now - lastInfoUpdate > 110;
+
+        const currentTimeStr = syncMode === "time" && globalTimeRange > 0
+            ? new Date(globalMinTime + globalProgress * globalTimeRange).toLocaleString('zh-CN')
+            : "";
+
+        document.getElementById('timeLabel').innerHTML = currentTimeStr ? `当前时间: ${currentTimeStr}` : "当前时间: --";
+
+        occupiedRects = [];
+
+        vehicles.forEach((vehicle, idx) => {
+            const isVisible = visible[idx];
+
+            // Marker 处理
+            if (markers[idx]) {
+                const pos = syncMode === "time" && globalTimeRange > 0
+                    ? getPositionAtTime(vehicle, globalMinTime + globalProgress * globalTimeRange)
+                    : getPositionAtDistance(vehicle, globalProgress);
+                markers[idx].setLatLng([pos.lat, pos.lng]);
+
+                if (isVisible) {
+                    if (!clusterGroup.hasLayer(markers[idx])) clusterGroup.addLayer(markers[idx]);
+                } else {
+                    if (clusterGroup.hasLayer(markers[idx])) clusterGroup.removeLayer(markers[idx]);
+                }
+            }
+
+            // 轨迹线处理
+            if (polylines[idx]) {
+                if (isVisible) {
+                    if (!map.hasLayer(polylines[idx])) map.addLayer(polylines[idx]);
+                } else {
+                    if (map.hasLayer(polylines[idx])) map.removeLayer(polylines[idx]);
+                }
+            }
+
+            // 信息框
+            if (infoDivs[idx]) {
+                infoDivs[idx].style.display = isVisible ? 'block' : 'none';
+            }
+
+            if (isVisible && shouldUpdateInfo) {
+                const pos = syncMode === "time" && globalTimeRange > 0
+                    ? getPositionAtTime(vehicle, globalMinTime + globalProgress * globalTimeRange)
+                    : getPositionAtDistance(vehicle, globalProgress);
+                const isFollowing = (vehicle.name === followVehicleName);
+                updateInfoPanel(vehicle, idx, [pos.lat, pos.lng], pos.currentDist, pos, isFollowing);
+            }
+        });
+
+        if (shouldUpdateInfo) lastInfoUpdate = now;
+        if (clusterGroup) clusterGroup.refreshClusters();
+
+        // 跟随车辆
+        if (followVehicleName) {
+            const idx = vehicles.findIndex(v => v.name === followVehicleName);
+            if (idx !== -1 && visible[idx]) {
+                const pos = syncMode === "time" && globalTimeRange > 0
+                    ? getPositionAtTime(vehicles[idx], globalMinTime + globalProgress * globalTimeRange)
+                    : getPositionAtDistance(vehicles[idx], globalProgress);
+
+                if (followPanTimeout) clearTimeout(followPanTimeout);
+                followPanTimeout = setTimeout(() => {
+                    map.panTo([pos.lat, pos.lng], {animate: true, duration: 0.6});
+                }, 80);
+            }
+        }
+    }
+
+    function updateInfoPanel(vehicle, idx, latLng, currentDist, pos, isFollowing = false) {
+        const div = infoDivs[idx];
+        if (!div) return;
+
+        div.innerHTML = `
+            <strong>${vehicle.name}</strong><br>
+            <span style="color:#0066cc;">全局: ${getCurrentTimeString()}</span><br>
+            <span style="color:#666;">车辆: ${pos.displayTime}</span><br>
+            距离: ${currentDist.toFixed(2)} km
+            <span class="close-btn" onclick="event.stopImmediatePropagation(); toggleInfoVisibility(${idx})">×</span>
+        `;
+
+        if (isFollowing) {
+            div.classList.add('following');
+        } else {
+            div.classList.remove('following');
+        }
+
+        const point = map.latLngToContainerPoint(latLng);
+        const best = getBestPosition(point, idx);
+
+        div.style.left = best.x + 'px';
+        div.style.top = best.y + 'px';
+        div.style.display = 'block';
+        occupiedRects.push(best.rect);
+    }
+
+    window.toggleInfoVisibility = function(idx) {
+        visible[idx] = !visible[idx];
+        updateAllMarkers();
+    };
+
+    function getCurrentTimeString() {
+        if (syncMode === "time" && globalTimeRange > 0) {
+            return new Date(globalMinTime + globalProgress * globalTimeRange).toLocaleString('zh-CN');
+        }
+        return "";
+    }
+
+    function resetAnimation() {
+        if (animationFrame) cancelAnimationFrame(animationFrame);
+        playing = false;
+        globalProgress = 0;
+        document.getElementById('progressSlider').value = 0;
+        document.getElementById('progressPercent').innerText = "0%";
+        updateAllMarkers();
+    }
+
+    let lastTimestamp = 0;
+    function animate(timestamp) {
+        if (!playing) return;
+        if (!lastTimestamp) lastTimestamp = timestamp;
+        const delta = (timestamp - lastTimestamp) / 1000 * speed * 0.32;
+        lastTimestamp = timestamp;
+
+        globalProgress = Math.min(globalProgress + delta, 1.0);
+        if (globalProgress >= 0.999) {
+            playing = false;
+            cancelAnimationFrame(animationFrame);
+        }
+
+        document.getElementById('progressSlider').value = globalProgress * 100;
+        document.getElementById('progressPercent').innerText = Math.round(globalProgress * 100) + "%";
+        updateAllMarkers();
+
+        if (playing) animationFrame = requestAnimationFrame(animate);
+    }
+
+    function startAnimation() {
+        if (globalProgress >= 0.999) resetAnimation();
+        playing = true;
+        lastTimestamp = 0;
+        animationFrame = requestAnimationFrame(animate);
+    }
+
+    function initMap() {
+        clusterGroup = L.markerClusterGroup({
+            showCoverageOnHover: false,
+            maxClusterRadius: 70,
+            disableClusteringAtZoom: 17
+        }).addTo(map);
+
+        const allCoords = [];
+
+        vehicles.forEach((vehicle, idx) => {
+            const coords = vehicle.coords.map(p => [parseFloat(p[0]), parseFloat(p[1])]);
+            allCoords.push(...coords);
+
+            const polyline = L.polyline(coords, { color: vehicle.color, weight: 4, opacity: 0.75 });
+            polylines.push(polyline);
+            map.addLayer(polyline);
+
+            const icon = L.divIcon({
+                html: `<div style="background:white;width:24px;height:24px;border-radius:50%;border:4px solid ${vehicle.color};box-shadow:0 0 10px rgba(0,0,0,0.4);"></div>`,
+                iconSize: [24, 24], iconAnchor: [12, 12]
+            });
+            const marker = L.marker(coords[0], { icon });
+            markers.push(marker);
+        });
+
+        markers.forEach(m => clusterGroup.addLayer(m));
+
+        if (allCoords.length) map.fitBounds(L.latLngBounds(allCoords), {padding: [60, 60]});
+
+        vehicles.forEach((vehicle, idx) => {
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'info-panel';
+            infoDiv.style.borderLeftColor = vehicle.color;
+            infoDiv.id = `info-${idx}`;
+            infoDiv.addEventListener('click', (e) => {
+                if (e.target.classList.contains('close-btn')) return;
+                const pos = markers[idx].getLatLng();
+                map.flyTo(pos, Math.max(map.getZoom(), 15), {duration: 1.2});
+                markers[idx].getElement().classList.add('pulse');
+                setTimeout(() => markers[idx].getElement().classList.remove('pulse'), 1500);
+            });
+            document.body.appendChild(infoDiv);
+            infoDivs.push(infoDiv);
+        });
+
+        updateAllMarkers();
+        map.on('moveend zoomend', () => {
+            if (Date.now() - lastInfoUpdate > 150) updateAllMarkers();
+        });
+    }
+
+    // ====================== 事件绑定 ======================
+    document.getElementById('playBtn').addEventListener('click', startAnimation);
+    document.getElementById('pauseBtn').addEventListener('click', () => {
+        playing = false;
+        if(animationFrame) cancelAnimationFrame(animationFrame);
+    });
+    document.getElementById('resetBtn').addEventListener('click', resetAnimation);
+    document.getElementById('progressSlider').addEventListener('input', (e) => {
+        if (animationFrame) cancelAnimationFrame(animationFrame);
+        playing = false;
+        globalProgress = parseFloat(e.target.value) / 100;
+        document.getElementById('progressPercent').innerText = Math.round(globalProgress * 100) + "%";
+        updateAllMarkers();
+    });
+
+    document.getElementById('followSelect').addEventListener('change', (e) => {
+        followVehicleName = e.target.value;
+        updateAllMarkers();
+    });
+
+    document.getElementById('syncModeSelect').addEventListener('change', (e) => {
+        syncMode = e.target.value;
+        document.getElementById('progressLabel').innerText = syncMode === "time" ? "时间进度: " : "里程进度: ";
+        updateAllMarkers();
+    });
+
+    document.getElementById('speedSlider').addEventListener('input', (e) => {
+        speed = parseFloat(e.target.value);
+        document.getElementById('speedValue').innerText = speed.toFixed(1);
+    });
+
+    // ====================== 车辆选择器（核心修复） ======================
+    function updateVehicleVisibility() {
+        const cbs = document.querySelectorAll('.vehicle-cb');
+        cbs.forEach((cb, i) => visible[i] = cb.checked);
+        updateAllMarkers();
+    }
+
+    initMap();
+
+    setTimeout(() => {
+        const checkboxContainer = document.getElementById('vehicleCheckboxes');
+        vehicles.forEach((v, idx) => {
+            const label = document.createElement('label');
+            label.innerHTML = `<input type="checkbox" class="vehicle-cb" checked> ${v.name}`;
+            checkboxContainer.appendChild(label);
+        });
+
+        document.querySelectorAll('.vehicle-cb').forEach(cb =>
+            cb.addEventListener('change', updateVehicleVisibility)
+        );
+
+        document.getElementById('selectAllBtn').addEventListener('click', () => {
+            document.querySelectorAll('.vehicle-cb').forEach(cb => cb.checked = true);
+            updateVehicleVisibility();
+        });
+
+        document.getElementById('deselectAllBtn').addEventListener('click', () => {
+            document.querySelectorAll('.vehicle-cb').forEach(cb => cb.checked = false);
+            updateVehicleVisibility();
+        });
+    }, 100);
+
+    // 选择车辆按钮点击
+    document.getElementById('vehicleSelectorBtn').addEventListener('click', function(e) {
+        e.stopPropagation();
+        const panel = document.getElementById('dropdownPanel');
+        panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+    });
+
+    // 点击外部关闭面板
+    document.addEventListener('click', function(e) {
+        const panel = document.getElementById('dropdownPanel');
+        const btn = document.getElementById('vehicleSelectorBtn');
+        if (!panel.contains(e.target) && !btn.contains(e.target)) {
+            panel.style.display = 'none';
+        }
+    });
+</script>
+</body>
+</html>
