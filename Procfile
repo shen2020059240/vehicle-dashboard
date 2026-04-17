@@ -1,1 +1,0 @@
-web: streamlit run generate_animation.py --server.port=$PORT --server.address=0.0.0.0
