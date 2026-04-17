@@ -13,6 +13,7 @@ import db
 # 初始化数据库
 db.init_db()
 
+
 # ====================== 工具函数 ======================
 def haversine_distance(lat1, lon1, lat2, lon2):
     if any(pd.isna(x) for x in [lat1, lon1, lat2, lon2]):
@@ -24,6 +25,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     dlambda = radians(lon2 - lon1)
     a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
     return 2 * R * asin(sqrt(a))
+
 
 @st.cache_data
 def simplify_trajectory(coords, tolerance=0.01):
@@ -40,21 +42,24 @@ def simplify_trajectory(coords, tolerance=0.01):
     kept_indices.append(len(coords) - 1)
     return simplified, kept_indices
 
+
 def parse_datetime_robust(series):
     try:
         return pd.to_datetime(series, format='%d/%m/%Y %I:%M:%S %p', dayfirst=True, errors='coerce')
     except:
         return pd.to_datetime(series, errors='coerce', dayfirst=True)
 
+
 def compute_trajectory_stats(df):
     df = df.sort_values('DateTime').reset_index(drop=True)
     df['Distance_km'] = 0.0
     for i in range(1, len(df)):
-        dist = haversine_distance(df.loc[i-1, 'Latitude'], df.loc[i-1, 'Longitude'],
+        dist = haversine_distance(df.loc[i - 1, 'Latitude'], df.loc[i - 1, 'Longitude'],
                                   df.loc[i, 'Latitude'], df.loc[i, 'Longitude'])
         df.loc[i, 'Distance_km'] = dist
     df['Cum_km'] = df['Distance_km'].cumsum()
     return df
+
 
 def compute_cycle_kpi(df):
     if df.empty or len(df) < 2:
@@ -67,8 +72,8 @@ def compute_cycle_kpi(df):
     total_hours = (df['DateTime'].iloc[-1] - df['DateTime'].iloc[0]).total_seconds() / 3600
     idle_seconds = 0
     for i in range(1, len(df)):
-        if df.loc[i, 'Distance_km'] < 0.1 and df.loc[i-1, 'Distance_km'] < 0.1:
-            delta = (df.loc[i, 'DateTime'] - df.loc[i-1, 'DateTime']).total_seconds()
+        if df.loc[i, 'Distance_km'] < 0.1 and df.loc[i - 1, 'Distance_km'] < 0.1:
+            delta = (df.loc[i, 'DateTime'] - df.loc[i - 1, 'DateTime']).total_seconds()
             if delta > 300:
                 idle_seconds += delta
     idle_hours = idle_seconds / 3600
@@ -83,6 +88,7 @@ def compute_cycle_kpi(df):
         "effective_ratio": round(effective_hours / total_hours * 100, 1) if total_hours > 0 else 0,
         "trip_rate": round(days / max((df['Date'].max() - df['Date'].min()).days, 1) * 100, 1)
     }
+
 
 @st.cache_data
 def load_vehicle_from_uploaded_file(uploaded_file, tolerance=0.01):
@@ -131,6 +137,7 @@ def load_vehicle_from_uploaded_file(uploaded_file, tolerance=0.01):
         st.toast(f"❌ 解析 {uploaded_file.name} 失败: {e}", icon="❌")
         return None
 
+
 def load_html_template():
     try:
         with open("animation_template.html", "r", encoding="utf-8") as f:
@@ -138,6 +145,7 @@ def load_html_template():
     except FileNotFoundError:
         st.error("❌ 未找到 animation_template.html 文件！")
         st.stop()
+
 
 @st.cache_data
 def generate_animation_html(vehicles_data_slim):
@@ -152,7 +160,7 @@ def generate_animation_html(vehicles_data_slim):
     global_max_time = None
     for name, data in vehicles_data_slim.items():
         cum = data['cum_km']
-        segment_dists = [cum[i+1] - cum[i] for i in range(len(cum)-1)]
+        segment_dists = [cum[i + 1] - cum[i] for i in range(len(cum) - 1)]
         total_dist = cum[-1] if cum else 0
         timestamps = []
         for ts in data['times']:
@@ -191,10 +199,20 @@ def generate_animation_html(vehicles_data_slim):
         .replace('{GLOBAL_MAX_TIME}', str(global_max_time))
     return html_content
 
+
 # ====================== Streamlit 主界面 ======================
 st.set_page_config(page_title="车辆轨迹动画生成器", layout="wide")
 st.title("🚚 多车辆轨迹动画生成器 - 周期看板版")
 
+# 初始化 session_state
+if 'current_vehicles' not in st.session_state:
+    st.session_state['current_vehicles'] = {}
+if 'current_vehicles_slim' not in st.session_state:
+    st.session_state['current_vehicles_slim'] = {}
+if 'current_batch_id' not in st.session_state:
+    st.session_state['current_batch_id'] = None
+
+# 侧边栏配置
 with st.sidebar:
     st.header("⚙️ 配置")
     preview_height = st.slider("动画预览高度 (px)", 600, 1200, 950, step=50)
@@ -203,110 +221,56 @@ with st.sidebar:
         min_value=0.001, max_value=0.1, value=0.01, step=0.001,
         help="值越大，轨迹点越少，动画越流畅。推荐 0.01~0.05"
     )
-
-# ====================== 数据源选择 ======================
-st.sidebar.markdown("---")
-st.sidebar.subheader("📁 数据源")
-data_source = st.sidebar.radio("选择数据来源", ["上传新文件", "使用历史批次"])
-
-current_vehicles = {}  # 完整数据（含 df，用于 KPI）
-current_vehicles_slim = {}  # 轻量数据（仅用于动画）
-
-if data_source == "上传新文件":
-    uploaded_files = st.file_uploader("上传 Excel 文件（可多选）", type=["xlsx", "xls"], accept_multiple_files=True)
-    if uploaded_files:
-        progress_bar = st.progress(0, text="解析文件中...")
-        vehicles_temp = {}
-        for i, file in enumerate(uploaded_files):
-            result = load_vehicle_from_uploaded_file(file, tolerance=simplify_tolerance)
-            if result:
-                name, df_simp = result
-                base_name = name
-                counter = 1
-                while name in vehicles_temp:
-                    name = f"{base_name}_{counter}"
-                    counter += 1
-                vehicles_temp[name] = {
-                    'coords': df_simp[['Latitude', 'Longitude']].values.tolist(),
-                    'cum_km': df_simp['Cum_km'].tolist(),
-                    'times': df_simp['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist(),
-                    'df': df_simp.copy()
-                }
-            progress_bar.progress((i+1) / len(uploaded_files))
-        progress_bar.empty()
-        if vehicles_temp:
-            # 存入数据库
-            batch_id = db.save_vehicle_batch(vehicles_temp)
-            st.success(f"✅ 成功加载 {len(vehicles_temp)} 辆车，已保存为批次 {batch_id}")
-            st.session_state['current_batch_id'] = batch_id
-            current_vehicles = vehicles_temp
-            # 生成 slim 版本（不含 df）
-            current_vehicles_slim = {name: {k: v[k] for k in ['coords', 'cum_km', 'times']}
-                                     for name, v in vehicles_temp.items()}
-        else:
-            st.warning("没有成功加载任何车辆")
-else:
-    # 历史批次选择
-    batches = db.get_all_batches()
-    if batches:
-        batch_options = {f"{b[0]} ({b[1]} 上传, {b[2]} 辆车)": b[0] for b in batches}
-        selected_label = st.sidebar.selectbox("选择批次", list(batch_options.keys()))
-        selected_batch_id = batch_options[selected_label]
-        if st.sidebar.button("加载此批次"):
-            vehicles_slim = db.load_batch_by_id(selected_batch_id)
-            if vehicles_slim:
-                # 注意：从数据库加载的只有 coords, cum_km, times，没有 df
-                # 需要重建 df 用于 KPI 计算
-                vehicles_full = {}
-                for name, data in vehicles_slim.items():
-                    # 重建 df（简化版，用于 KPI）
-                    df_rebuilt = pd.DataFrame({
-                        'Latitude': [c[0] for c in data['coords']],
-                        'Longitude': [c[1] for c in data['coords']],
-                        'DateTime': pd.to_datetime(data['times'])
-                    })
-                    df_rebuilt = compute_trajectory_stats(df_rebuilt)
-                    vehicles_full[name] = {
-                        'coords': data['coords'],
-                        'cum_km': data['cum_km'],
-                        'times': data['times'],
-                        'df': df_rebuilt
+    st.markdown("---")
+    st.subheader("📁 上传新批次")
+    uploaded_files = st.file_uploader(
+        "上传 Excel 文件（可多选）",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        key="batch_upload"
+    )
+    batch_name_input = st.text_input(
+        "批次名称",
+        value=f"{datetime.now().strftime('%Y年%m月')} 数据",
+        help="为本次上传的数据起个名字，例如「2026年3月运营数据」"
+    )
+    if uploaded_files and st.button("保存为新批次", type="primary", use_container_width=True):
+        with st.spinner("解析并保存中..."):
+            vehicles_temp = {}
+            for file in uploaded_files:
+                result = load_vehicle_from_uploaded_file(file, tolerance=simplify_tolerance)
+                if result:
+                    name, df_simp = result
+                    base_name = name
+                    counter = 1
+                    while name in vehicles_temp:
+                        name = f"{base_name}_{counter}"
+                        counter += 1
+                    vehicles_temp[name] = {
+                        'coords': df_simp[['Latitude', 'Longitude']].values.tolist(),
+                        'cum_km': df_simp['Cum_km'].tolist(),
+                        'times': df_simp['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist(),
+                        'df': df_simp.copy()
                     }
-                st.session_state['current_batch_id'] = selected_batch_id
-                current_vehicles = vehicles_full
-                current_vehicles_slim = vehicles_slim
-                st.success(f"已加载批次 {selected_batch_id}，共 {len(vehicles_slim)} 辆车")
+            if vehicles_temp:
+                batch_id = db.save_vehicle_batch(vehicles_temp, batch_name=batch_name_input)
+                st.success(f"✅ 成功保存 {len(vehicles_temp)} 辆车，批次「{batch_name_input}」已入库")
+                # 自动加载刚保存的批次
+                st.session_state['current_vehicles'] = vehicles_temp
+                st.session_state['current_vehicles_slim'] = {name: {k: v[k] for k in ['coords', 'cum_km', 'times']}
+                                                             for name, v in vehicles_temp.items()}
+                st.session_state['current_batch_id'] = batch_id
                 st.rerun()
             else:
-                st.error("加载失败")
-    else:
-        st.sidebar.info("暂无历史批次，请先上传文件")
+                st.error("没有成功解析任何文件")
 
-# ====================== 显示内容 ======================
-if current_vehicles:
-    st.success(f"✅ 当前展示 {len(current_vehicles)} 辆车")
+# ====================== 主界面 Tabs ======================
+tab1, tab2, tab3 = st.tabs(["📊 周期KPI看板", "🎬 轨迹动画预览", "🗄️ 批次管理"])
 
-    # 生成缓存签名
-    data_signature = hashlib.md5(
-        json.dumps({name: {'coords_len': len(v['coords']), 'cum_km_last': v['cum_km'][-1]}
-                    for name, v in current_vehicles_slim.items()}, sort_keys=True).encode()
-    ).hexdigest()
-
-    # 检查是否需要重新生成 HTML
-    if 'cached_html' not in st.session_state or st.session_state.get('html_signature') != data_signature:
-        with st.spinner("生成动画中...（首次加载较慢，后续秒开）"):
-            html_content = generate_animation_html(current_vehicles_slim)
-            if html_content:
-                st.session_state['cached_html'] = html_content
-                st.session_state['html_signature'] = data_signature
-    else:
-        html_content = st.session_state['cached_html']
-
-    # ==================== Tabs ====================
-    tab1, tab2, tab3 = st.tabs(["📊 周期KPI看板", "🎬 轨迹动画预览", "🗄️ 批次管理"])
-
-    # ---------- Tab 1: KPI ----------
-    with tab1:
+# ---------- Tab 1: KPI 看板 ----------
+with tab1:
+    vehicles = st.session_state['current_vehicles']
+    if vehicles:
         st.subheader("📅 周期筛选")
         col1, col2 = st.columns(2)
         with col1:
@@ -315,7 +279,7 @@ if current_vehicles:
             end_date = st.date_input("结束日期", value=pd.Timestamp.now())
         st.subheader("📊 周期运营核心KPI")
         kpi_rows = []
-        for name, v in current_vehicles.items():
+        for name, v in vehicles.items():
             df_filtered = v['df'][(v['df']['DateTime'].dt.date >= start_date) &
                                   (v['df']['DateTime'].dt.date <= end_date)]
             kpi = compute_cycle_kpi(df_filtered)
@@ -333,7 +297,7 @@ if current_vehicles:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 pd.DataFrame(kpi_rows).to_excel(writer, sheet_name="核心KPI", index=False)
-                for name, v in current_vehicles.items():
+                for name, v in vehicles.items():
                     v['df'].to_excel(writer, sheet_name=name[:30], index=False)
             output.seek(0)
             st.download_button(
@@ -342,9 +306,27 @@ if current_vehicles:
                 file_name=f"卡车运营报表_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+    else:
+        st.info("暂无车辆数据，请先在左侧上传新批次或在「批次管理」中加载已有批次")
 
-    # ---------- Tab 2: 动画 ----------
-    with tab2:
+# ---------- Tab 2: 动画预览 ----------
+with tab2:
+    vehicles_slim = st.session_state['current_vehicles_slim']
+    if vehicles_slim:
+        # 生成缓存签名
+        data_signature = hashlib.md5(
+            json.dumps({name: {'coords_len': len(v['coords']), 'cum_km_last': v['cum_km'][-1]}
+                        for name, v in vehicles_slim.items()}, sort_keys=True).encode()
+        ).hexdigest()
+        if 'cached_html' not in st.session_state or st.session_state.get('html_signature') != data_signature:
+            with st.spinner("生成动画中...（首次加载较慢，后续秒开）"):
+                html_content = generate_animation_html(vehicles_slim)
+                if html_content:
+                    st.session_state['cached_html'] = html_content
+                    st.session_state['html_signature'] = data_signature
+        else:
+            html_content = st.session_state['cached_html']
+
         if st.button("🎬 生成并预览动画", type="primary", use_container_width=True):
             if html_content:
                 b64 = base64.b64encode(html_content.encode('utf-8')).decode()
@@ -355,25 +337,63 @@ if current_vehicles:
                 st.components.v1.html(html_content, height=preview_height, scrolling=True)
             else:
                 st.error("动画生成失败")
+    else:
+        st.info("暂无车辆数据，请先加载批次")
 
-    # ---------- Tab 3: 批次管理 ----------
-    with tab3:
-        st.subheader("已保存的历史批次")
-        batches = db.get_all_batches()
-        if batches:
-            batch_df = pd.DataFrame(batches, columns=["批次ID", "上传时间", "车辆数"])
-            st.dataframe(batch_df, use_container_width=True, hide_index=True)
-            batch_to_delete = st.selectbox("选择要删除的批次", batch_df["批次ID"].tolist())
-            if st.button("删除选定批次", type="secondary"):
-                db.delete_batch(batch_to_delete)
-                st.success(f"批次 {batch_to_delete} 已删除")
-                st.rerun()
-        else:
-            st.info("暂无历史批次")
-        if st.button("刷新批次列表"):
-            st.rerun()
+# ---------- Tab 3: 批次管理 ----------
+with tab3:
+    st.subheader("🗄️ 批次管理")
+    batches = db.get_all_batches()
+    if batches:
+        for batch_id, batch_name, upload_time, vehicle_count in batches:
+            col1, col2, col3, col4, col5 = st.columns([2, 3, 2, 1, 1])
+            with col1:
+                st.write(f"**{batch_name}**")
+            with col2:
+                st.write(f"`{batch_id}`")
+            with col3:
+                st.write(f"{upload_time}  ({vehicle_count} 辆车)")
+            with col4:
+                if st.button("📂 加载", key=f"load_{batch_id}"):
+                    vehicles_slim = db.load_batch_by_id(batch_id)
+                    if vehicles_slim:
+                        # 重建 full 数据用于 KPI
+                        vehicles_full = {}
+                        for name, data in vehicles_slim.items():
+                            df_rebuilt = pd.DataFrame({
+                                'Latitude': [c[0] for c in data['coords']],
+                                'Longitude': [c[1] for c in data['coords']],
+                                'DateTime': pd.to_datetime(data['times'])
+                            })
+                            df_rebuilt = compute_trajectory_stats(df_rebuilt)
+                            vehicles_full[name] = {
+                                'coords': data['coords'],
+                                'cum_km': data['cum_km'],
+                                'times': data['times'],
+                                'df': df_rebuilt
+                            }
+                        st.session_state['current_vehicles'] = vehicles_full
+                        st.session_state['current_vehicles_slim'] = vehicles_slim
+                        st.session_state['current_batch_id'] = batch_id
+                        st.success(f"已加载批次「{batch_name}」")
+                        st.rerun()
+            with col5:
+                if st.button("🗑️ 删除", key=f"del_{batch_id}"):
+                    db.delete_batch(batch_id)
+                    st.success(f"批次「{batch_name}」已删除")
+                    if st.session_state.get('current_batch_id') == batch_id:
+                        # 清空当前显示的数据
+                        st.session_state['current_vehicles'] = {}
+                        st.session_state['current_vehicles_slim'] = {}
+                        st.session_state['current_batch_id'] = None
+                        for key in ['cached_html', 'html_signature']:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                    st.rerun()
+    else:
+        st.info("暂无历史批次，请先在左侧上传新批次")
 
-else:
-    st.info("👈 请先在左侧选择数据来源并上传文件或加载历史批次")
+    if st.button("🔄 刷新批次列表"):
+        st.rerun()
 
-st.caption("KPI看板、动画预览与批次管理已整合")
+st.caption("KPI看板、动画预览与批次管理已整合 | 数据持久化使用 SQLite")
