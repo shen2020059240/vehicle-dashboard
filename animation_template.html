@@ -109,7 +109,11 @@
     const globalMaxTime = {GLOBAL_MAX_TIME};
     const globalTimeRange = globalMaxTime - globalMinTime;
 
-    let map = L.map('map').setView([0, 0], 6);
+    // 性能优化：默认只显示前10辆车（可调整）
+    const MAX_INITIAL_VEHICLES = 10;
+
+    // 启用 Canvas 渲染
+    let map = L.map('map', { preferCanvas: true }).setView([0, 0], 6);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png').addTo(map);
 
     let polylines = [], markers = [], infoDivs = [], visible = [];
@@ -119,7 +123,8 @@
     let lastInfoUpdate = 0;
     let followPanTimeout = null;
 
-    for (let i = 0; i < vehicles.length; i++) visible.push(true);
+    // 初始可见性：只显示前 MAX_INITIAL_VEHICLES 辆
+    for (let i = 0; i < vehicles.length; i++) visible.push(i < MAX_INITIAL_VEHICLES);
     let occupiedRects = [];
 
     function getBestPosition(point, idx, width = 240, height = 96) {
@@ -363,8 +368,10 @@
     function initMap() {
         clusterGroup = L.markerClusterGroup({
             showCoverageOnHover: false,
-            maxClusterRadius: 70,
-            disableClusteringAtZoom: 17
+            maxClusterRadius: 80,
+            disableClusteringAtZoom: 16,
+            spiderfyOnMaxZoom: false,
+            removeOutsideVisibleBounds: true
         }).addTo(map);
 
         const allCoords = [];
@@ -373,7 +380,13 @@
             const coords = vehicle.coords.map(p => [parseFloat(p[0]), parseFloat(p[1])]);
             allCoords.push(...coords);
 
-            const polyline = L.polyline(coords, { color: vehicle.color, weight: 4, opacity: 0.75 });
+            // 优化轨迹线：smoothFactor 减少顶点渲染
+            const polyline = L.polyline(coords, {
+                color: vehicle.color,
+                weight: 3,
+                opacity: 0.7,
+                smoothFactor: 2.0
+            });
             polylines.push(polyline);
             map.addLayer(polyline);
 
@@ -442,7 +455,7 @@
         document.getElementById('speedValue').innerText = speed.toFixed(1);
     });
 
-    // ====================== 车辆选择器（核心修复） ======================
+    // ====================== 车辆选择器 ======================
     function updateVehicleVisibility() {
         const cbs = document.querySelectorAll('.vehicle-cb');
         cbs.forEach((cb, i) => visible[i] = cb.checked);
@@ -455,7 +468,8 @@
         const checkboxContainer = document.getElementById('vehicleCheckboxes');
         vehicles.forEach((v, idx) => {
             const label = document.createElement('label');
-            label.innerHTML = `<input type="checkbox" class="vehicle-cb" checked> ${v.name}`;
+            const isChecked = idx < MAX_INITIAL_VEHICLES;
+            label.innerHTML = `<input type="checkbox" class="vehicle-cb" ${isChecked ? 'checked' : ''}> ${v.name}`;
             checkboxContainer.appendChild(label);
         });
 
@@ -474,14 +488,12 @@
         });
     }, 100);
 
-    // 选择车辆按钮点击
     document.getElementById('vehicleSelectorBtn').addEventListener('click', function(e) {
         e.stopPropagation();
         const panel = document.getElementById('dropdownPanel');
         panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
     });
 
-    // 点击外部关闭面板
     document.addEventListener('click', function(e) {
         const panel = document.getElementById('dropdownPanel');
         const btn = document.getElementById('vehicleSelectorBtn');
